@@ -13,3 +13,10 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# libcore build artifacts
+/libcore/.build/
+/libcore/libcore.aar
+/libcore/libcore-sources.jar
+/app/libs/libcore.aar
+/app/libs/libcore-sources.jar
