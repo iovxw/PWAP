@@ -2,4 +2,10 @@
 <resources>
 
     <style name="Theme.PWAP" parent="Theme.AppCompat.Light.NoActionBar" />
+
+    <style name="Theme.PWAP.Splash" parent="Theme.SplashScreen">
+        <item name="postSplashScreenTheme">@style/Theme.PWAP</item>
+        <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher</item>
+        <item name="windowSplashScreenBackground">@android:color/white</item>
+    </style>
 </resources>

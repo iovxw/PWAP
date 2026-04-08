@@ -41,11 +41,13 @@ import java.util.concurrent.Executor
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun WebViewScreen(targetUrl: String, onUrlChanged: ((String) -> Unit)? = null) {
+fun WebViewScreen(targetUrl: String, onInitialPageRendered: () -> Unit = {}) {
     val context = LocalContext.current
     val proxyState by ProxyManager.state.collectAsState()
     val proxyPort by ProxyManager.currentPort.collectAsState()
     var webView by remember { mutableStateOf<WebView?>(null) }
+    var canGoBack by remember { mutableStateOf(false) }
+    var initialPageRendered by remember { mutableStateOf(false) }
     var loadingProgress by remember { mutableIntStateOf(0) }
     var isLoading by remember { mutableStateOf(true) }
 
@@ -88,72 +90,95 @@ fun WebViewScreen(targetUrl: String, onUrlChanged: ((String) -> Unit)? = null) {
         ProxyManager.ProxyState.RUNNING -> {
             Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                 Column(modifier = Modifier.fillMaxSize().systemBarsPadding()) {
-                if (isLoading) {
-                    LinearProgressIndicator(
-                        progress = { loadingProgress / 100f },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-                AndroidView(
-                    modifier = Modifier.fillMaxSize(),
-                    factory = { ctx ->
-                        WebView(ctx).apply {
-                            settings.javaScriptEnabled = true
-                            settings.domStorageEnabled = true
-                            settings.databaseEnabled = true
-                            settings.setSupportZoom(true)
-                            settings.builtInZoomControls = true
-                            settings.displayZoomControls = false
-                            settings.loadWithOverviewMode = true
-                            settings.useWideViewPort = true
+                    if (isLoading) {
+                        LinearProgressIndicator(
+                            progress = { loadingProgress / 100f },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    AndroidView(
+                        modifier = Modifier.fillMaxSize(),
+                        factory = { ctx ->
+                            WebView(ctx).apply {
+                                setBackgroundColor(backgroundColor)
+                                settings.javaScriptEnabled = true
+                                settings.domStorageEnabled = true
+                                settings.databaseEnabled = true
+                                settings.setSupportZoom(true)
+                                settings.builtInZoomControls = true
+                                settings.displayZoomControls = false
+                                settings.loadWithOverviewMode = true
+                                settings.useWideViewPort = true
 
-                            val targetHost = Uri.parse(targetUrl).host ?: ""
+                                val targetHost = Uri.parse(targetUrl).host ?: ""
 
-                            webViewClient = object : WebViewClient() {
-                                override fun shouldOverrideUrlLoading(
-                                    view: WebView?,
-                                    request: WebResourceRequest?
-                                ): Boolean {
-                                    val url = request?.url ?: return false
-                                    val requestHost = url.host ?: return false
-
-                                    // Same domain (including subdomains) - load in WebView
-                                    if (isSameDomain(requestHost, targetHost)) {
-                                        return false
+                                webViewClient = object : WebViewClient() {
+                                    override fun doUpdateVisitedHistory(
+                                        view: WebView?,
+                                        url: String?,
+                                        isReload: Boolean
+                                    ) {
+                                        canGoBack = view?.canGoBack() == true
                                     }
 
-                                    // Different domain - open in external browser (PWA behavior)
-                                    try {
-                                        context.startActivity(
-                                            Intent(Intent.ACTION_VIEW, url)
-                                        )
-                                    } catch (_: Exception) {}
-                                    return true
+                                    override fun shouldOverrideUrlLoading(
+                                        view: WebView?,
+                                        request: WebResourceRequest?
+                                    ): Boolean {
+                                        val url = request?.url ?: return false
+                                        val requestHost = url.host ?: return false
+
+                                        // Same domain (including subdomains) - load in WebView
+                                        if (isSameDomain(requestHost, targetHost)) {
+                                            return false
+                                        }
+
+                                        // Different domain - open in external browser (PWA behavior)
+                                        try {
+                                            context.startActivity(
+                                                Intent(Intent.ACTION_VIEW, url)
+                                            )
+                                        } catch (_: Exception) {}
+                                        return true
+                                    }
+
+                                    override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                                        isLoading = true
+                                        canGoBack = view?.canGoBack() == true
+                                    }
+
+                                    override fun onPageFinished(view: WebView?, url: String?) {
+                                        isLoading = false
+                                        canGoBack = view?.canGoBack() == true
+                                        if (!initialPageRendered && view != null) {
+                                            view.postVisualStateCallback(
+                                                1L,
+                                                object : WebView.VisualStateCallback() {
+                                                    override fun onComplete(requestId: Long) {
+                                                        if (!initialPageRendered) {
+                                                            initialPageRendered = true
+                                                            onInitialPageRendered()
+                                                        }
+                                                    }
+                                                }
+                                            )
+                                        }
+                                    }
                                 }
 
-                                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                                    isLoading = true
+                                webChromeClient = object : WebChromeClient() {
+                                    override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                                        loadingProgress = newProgress
+                                        canGoBack = view?.canGoBack() == true
+                                        if (newProgress >= 100) isLoading = false
+                                    }
                                 }
-
-                                override fun onPageFinished(view: WebView?, url: String?) {
-                                    isLoading = false
-                                    url?.let { onUrlChanged?.invoke(it) }
-                                }
-                            }
-
-                            webChromeClient = object : WebChromeClient() {
-                                override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                                    loadingProgress = newProgress
-                                    if (newProgress >= 100) isLoading = false
-                                }
-                            }
 
                             webView = this
                         }
-                    }
-                )
+                    )
+                }
             }
-            } // Surface
         }
 
         ProxyManager.ProxyState.STARTING -> {
