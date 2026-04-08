@@ -23,10 +23,6 @@ class AppPreferences(context: Context) {
     val isConfigured: Boolean
         get() = targetUrl.isNotBlank() && proxyConfig.isNotBlank()
 
-    var lastVisitedUrl: String
-        get() = prefs.getString(KEY_LAST_URL, "") ?: ""
-        set(value) = prefs.edit { putString(KEY_LAST_URL, value) }
-
     var dnsServer: String
         get() = prefs.getString(KEY_DNS_SERVER, DEFAULT_DNS) ?: DEFAULT_DNS
         set(value) = prefs.edit { putString(KEY_DNS_SERVER, value) }
@@ -35,7 +31,6 @@ class AppPreferences(context: Context) {
         private const val KEY_TARGET_URL = "target_url"
         private const val KEY_PROXY_CONFIG = "proxy_config"
         private const val KEY_FIRST_LAUNCH = "first_launch"
-        private const val KEY_LAST_URL = "last_visited_url"
         private const val KEY_DNS_SERVER = "dns_server"
         private const val DEFAULT_DNS = "8.8.8.8"
     }

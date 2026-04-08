@@ -9,6 +9,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import net.iovxw.pwap.data.AppPreferences
 import net.iovxw.pwap.proxy.ProxyManager
@@ -68,7 +69,6 @@ class MainActivity : ComponentActivity() {
                         }
                     )
                 } else {
-                    val initialUrl = preferences.lastVisitedUrl.ifBlank { preferences.targetUrl }
                     WebViewScreen(
                         targetUrl = preferences.targetUrl,
                         onInitialPageRendered = ::releaseStartupSplash
