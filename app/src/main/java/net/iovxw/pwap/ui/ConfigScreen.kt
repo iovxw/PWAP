@@ -255,7 +255,6 @@ fun ConfigScreen(
                     preferences.proxyConfig = proxyConfig
                     preferences.dnsServer = dnsServer
                     preferences.isFirstLaunch = false
-                    preferences.lastVisitedUrl = ""
                     onSave()
                 },
                 enabled = targetUrl.isNotBlank() && proxyConfig.isNotBlank(),
