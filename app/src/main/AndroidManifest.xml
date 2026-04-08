@@ -17,6 +17,18 @@
         android:usesCleartextTraffic="true">
         <activity
             android:name=".MainActivity"
+            android:exported="false"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.PWAP" />
+        <activity
+            android:name=".scanner.ScannerActivity"
+            android:theme="@style/Theme.PWAP" />
+        <activity
+            android:name=".browser.ExternalWebViewActivity"
+            android:exported="false"
+            android:theme="@style/Theme.PWAP" />
+        <activity
+            android:name=".browser.PureWebViewActivity"
             android:exported="true"
             android:label="@string/app_name"
             android:theme="@style/Theme.PWAP.Splash">
@@ -25,9 +37,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <activity
-            android:name=".scanner.ScannerActivity"
-            android:theme="@style/Theme.PWAP" />
     </application>
 
 </manifest>
