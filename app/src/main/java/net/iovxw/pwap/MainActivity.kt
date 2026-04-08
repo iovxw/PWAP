@@ -1,21 +1,18 @@
 package net.iovxw.pwap
 
+import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.launch
 import net.iovxw.pwap.data.AppPreferences
-import net.iovxw.pwap.proxy.ProxyManager
+import net.iovxw.pwap.browser.PureWebViewActivity
 import net.iovxw.pwap.sensor.ProximitySensorManager
 import net.iovxw.pwap.ui.ConfigScreen
-import net.iovxw.pwap.ui.WebViewScreen
 import net.iovxw.pwap.ui.theme.PWAPTheme
 
 class MainActivity : ComponentActivity() {
@@ -23,39 +20,23 @@ class MainActivity : ComponentActivity() {
     private lateinit var preferences: AppPreferences
     private lateinit var proximitySensor: ProximitySensorManager
     private var showConfig by mutableStateOf(false)
-    private var keepSplashVisible = true
-    private var waitingForInitialPage = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        val splashScreen = installSplashScreen()
-        splashScreen.setKeepOnScreenCondition { keepSplashVisible }
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
 
         preferences = AppPreferences(this)
+        val forceConfig = intent.getBooleanExtra(EXTRA_FORCE_CONFIG, false)
 
-        // Show config on first launch or if not configured
-        showConfig = preferences.isFirstLaunch || !preferences.isConfigured
-        waitingForInitialPage = preferences.isConfigured && !showConfig
-        keepSplashVisible = waitingForInitialPage
+        showConfig = forceConfig || preferences.isFirstLaunch || !preferences.isConfigured
 
         proximitySensor = ProximitySensorManager(this) {
             runOnUiThread { showConfig = true }
         }
 
-        if (waitingForInitialPage) {
-            lifecycleScope.launch {
-                ProxyManager.state.collectLatest { state ->
-                    if (waitingForInitialPage && state == ProxyManager.ProxyState.ERROR) {
-                        releaseStartupSplash()
-                    }
-                }
-            }
-        }
-
-        // Auto-start proxy if configured
-        if (preferences.isConfigured && !showConfig) {
-            startProxy()
+        if (!showConfig) {
+            launchPureHost()
+            return
         }
 
         setContent {
@@ -64,46 +45,39 @@ class MainActivity : ComponentActivity() {
                     ConfigScreen(
                         preferences = preferences,
                         onSave = {
-                            showConfig = false
-                            startProxy()
+                            launchPureHost()
                         }
-                    )
-                } else {
-                    WebViewScreen(
-                        targetUrl = preferences.targetUrl,
-                        onInitialPageRendered = ::releaseStartupSplash
                     )
                 }
             }
         }
     }
 
-    private fun releaseStartupSplash() {
-        keepSplashVisible = false
-        waitingForInitialPage = false
-    }
-
-    private fun startProxy() {
-        lifecycleScope.launch {
-            ProxyManager.start(
-                preferences.proxyConfig,
-                preferences.dnsServer
-            )
-        }
+    private fun launchPureHost() {
+        startActivity(PureWebViewActivity.createIntent(this))
+        finish()
     }
 
     override fun onResume() {
         super.onResume()
-        proximitySensor.register()
+        if (showConfig) {
+            proximitySensor.register()
+        }
     }
 
     override fun onPause() {
         super.onPause()
-        proximitySensor.unregister()
+        if (showConfig) {
+            proximitySensor.unregister()
+        }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        lifecycleScope.launch { ProxyManager.stop() }
+    companion object {
+        private const val EXTRA_FORCE_CONFIG = "extra_force_config"
+
+        fun createConfigIntent(context: Context): Intent {
+            return Intent(context, MainActivity::class.java)
+                .putExtra(EXTRA_FORCE_CONFIG, true)
+        }
     }
 }
