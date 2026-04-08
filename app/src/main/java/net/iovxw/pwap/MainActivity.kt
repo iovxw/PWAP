@@ -4,6 +4,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -21,8 +22,12 @@ class MainActivity : ComponentActivity() {
     private lateinit var preferences: AppPreferences
     private lateinit var proximitySensor: ProximitySensorManager
     private var showConfig by mutableStateOf(false)
+    private var keepSplashVisible = true
+    private var waitingForInitialPage = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        val splashScreen = installSplashScreen()
+        splashScreen.setKeepOnScreenCondition { keepSplashVisible }
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
 
@@ -30,9 +35,21 @@ class MainActivity : ComponentActivity() {
 
         // Show config on first launch or if not configured
         showConfig = preferences.isFirstLaunch || !preferences.isConfigured
+        waitingForInitialPage = preferences.isConfigured && !showConfig
+        keepSplashVisible = waitingForInitialPage
 
         proximitySensor = ProximitySensorManager(this) {
             runOnUiThread { showConfig = true }
+        }
+
+        if (waitingForInitialPage) {
+            lifecycleScope.launch {
+                ProxyManager.state.collectLatest { state ->
+                    if (waitingForInitialPage && state == ProxyManager.ProxyState.ERROR) {
+                        releaseStartupSplash()
+                    }
+                }
+            }
         }
 
         // Auto-start proxy if configured
@@ -53,12 +70,17 @@ class MainActivity : ComponentActivity() {
                 } else {
                     val initialUrl = preferences.lastVisitedUrl.ifBlank { preferences.targetUrl }
                     WebViewScreen(
-                        targetUrl = initialUrl,
-                        onUrlChanged = { url -> preferences.lastVisitedUrl = url }
+                        targetUrl = preferences.targetUrl,
+                        onInitialPageRendered = ::releaseStartupSplash
                     )
                 }
             }
         }
+    }
+
+    private fun releaseStartupSplash() {
+        keepSplashVisible = false
+        waitingForInitialPage = false
     }
 
     private fun startProxy() {
