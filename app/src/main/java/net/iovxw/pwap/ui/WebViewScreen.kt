@@ -30,6 +30,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -50,10 +51,14 @@ fun WebViewScreen(targetUrl: String, onInitialPageRendered: () -> Unit = {}) {
     var initialPageRendered by remember { mutableStateOf(false) }
     var loadingProgress by remember { mutableIntStateOf(0) }
     var isLoading by remember { mutableStateOf(true) }
+    val backgroundColor = MaterialTheme.colorScheme.background.toArgb()
 
     // Handle back button for WebView navigation
-    BackHandler(enabled = webView?.canGoBack() == true) {
-        webView?.goBack()
+    BackHandler(enabled = canGoBack) {
+        webView?.let { view ->
+            view.goBack()
+            canGoBack = view.canGoBack()
+        }
     }
 
     // Set up proxy when proxy is running
@@ -174,7 +179,12 @@ fun WebViewScreen(targetUrl: String, onInitialPageRendered: () -> Unit = {}) {
                                     }
                                 }
 
-                            webView = this
+                                webView = this
+                                canGoBack = canGoBack()
+                            }
+                        },
+                        update = { view ->
+                            view.setBackgroundColor(backgroundColor)
                         }
                     )
                 }
@@ -182,25 +192,29 @@ fun WebViewScreen(targetUrl: String, onInitialPageRendered: () -> Unit = {}) {
         }
 
         ProxyManager.ProxyState.STARTING -> {
-            Box(modifier = Modifier.fillMaxSize().systemBarsPadding(), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    LinearProgressIndicator()
-                    Text(
-                        text = "正在连接代理...",
-                        modifier = Modifier.padding(top = 16.dp),
-                        style = MaterialTheme.typography.bodyLarge
-                    )
+            Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                Box(modifier = Modifier.fillMaxSize().systemBarsPadding(), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        LinearProgressIndicator()
+                        Text(
+                            text = "正在连接代理...",
+                            modifier = Modifier.padding(top = 16.dp),
+                            style = MaterialTheme.typography.bodyLarge
+                        )
+                    }
                 }
             }
         }
 
         else -> {
-            Box(modifier = Modifier.fillMaxSize().systemBarsPadding(), contentAlignment = Alignment.Center) {
-                Text(
-                    text = "代理未连接",
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.error
-                )
+            Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                Box(modifier = Modifier.fillMaxSize().systemBarsPadding(), contentAlignment = Alignment.Center) {
+                    Text(
+                        text = "代理未连接",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
             }
         }
     }
