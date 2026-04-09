@@ -1,15 +1,18 @@
 package net.iovxw.pwap.browser
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.os.Message
+import android.webkit.PermissionRequest
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -22,6 +25,7 @@ import android.widget.ProgressBar
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.ColorUtils
@@ -53,6 +57,8 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
     private var initialUrlLoaded = false
     private var initialPageFinished = false
     private var pendingFileChooserCallback: ValueCallback<Array<Uri>>? = null
+    private var pendingWebPermission: PendingWebPermissionRequest? = null
+    private var permissionPromptDialog: AlertDialog? = null
 
     private val fallbackSystemBarColor: Int by lazy(LazyThreadSafetyMode.NONE) {
         ContextCompat.getColor(this, R.color.splash_background)
@@ -76,6 +82,21 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
                 Toast.makeText(this, "所选文件无法访问", Toast.LENGTH_SHORT).show()
             }
             callback.onReceiveValue(acceptedUris)
+        }
+    private val webPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+            val pendingRequest = pendingWebPermission ?: return@registerForActivityResult
+            pendingWebPermission = null
+            val deniedPermissions = pendingRequest.androidPermissions.filter { permission ->
+                result[permission] != true &&
+                    ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED
+            }
+            if (deniedPermissions.isEmpty()) {
+                pendingRequest.request.grant(pendingRequest.resources.toTypedArray())
+            } else {
+                pendingRequest.request.deny()
+                Toast.makeText(this, "系统权限被拒绝", Toast.LENGTH_SHORT).show()
+            }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -127,6 +148,10 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
     override fun onDestroy() {
         pendingFileChooserCallback?.onReceiveValue(null)
         pendingFileChooserCallback = null
+        permissionPromptDialog?.dismiss()
+        permissionPromptDialog = null
+        pendingWebPermission?.request?.deny()
+        pendingWebPermission = null
         if (::webView.isInitialized) {
             webView.stopLoading()
             webView.destroy()
@@ -248,6 +273,24 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
                 progressBar.isVisible = newProgress < 100
             }
 
+            override fun onPermissionRequest(request: PermissionRequest?) {
+                val safeRequest = request ?: return
+                runOnUiThread {
+                    handleWebPermissionRequest(safeRequest)
+                }
+            }
+
+            override fun onPermissionRequestCanceled(request: PermissionRequest?) {
+                val safeRequest = request ?: return
+                runOnUiThread {
+                    if (pendingWebPermission?.request == safeRequest) {
+                        permissionPromptDialog?.dismiss()
+                        permissionPromptDialog = null
+                        pendingWebPermission = null
+                    }
+                }
+            }
+
             override fun onShowFileChooser(
                 webView: WebView?,
                 filePathCallback: ValueCallback<Array<Uri>>?,
@@ -315,6 +358,88 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
         }
     }
 
+    private fun handleWebPermissionRequest(request: PermissionRequest) {
+        val resources = request.resources
+            .filter { it == PermissionRequest.RESOURCE_VIDEO_CAPTURE || it == PermissionRequest.RESOURCE_AUDIO_CAPTURE }
+            .distinct()
+
+        if (resources.isEmpty()) {
+            request.deny()
+            return
+        }
+
+        permissionPromptDialog?.dismiss()
+        pendingWebPermission?.request?.deny()
+
+        val pendingRequest = PendingWebPermissionRequest(
+            request = request,
+            origin = request.origin,
+            resources = resources,
+            androidPermissions = resources.mapNotNull(::toAndroidPermission).distinct()
+        )
+
+        if (isTrustedSiteOrigin(request.origin)) {
+            continueGrantWebPermission(pendingRequest)
+            return
+        }
+
+        pendingWebPermission = pendingRequest
+        permissionPromptDialog = AlertDialog.Builder(this)
+            .setTitle("网站请求设备权限")
+            .setMessage(buildPermissionRequestMessage(pendingRequest))
+            .setPositiveButton("允许") { _, _ ->
+                permissionPromptDialog = null
+                continueGrantWebPermission(pendingRequest)
+            }
+            .setNegativeButton("拒绝") { _, _ ->
+                permissionPromptDialog = null
+                pendingWebPermission = null
+                request.deny()
+            }
+            .setOnCancelListener {
+                permissionPromptDialog = null
+                pendingWebPermission = null
+                request.deny()
+            }
+            .show()
+    }
+
+    private fun continueGrantWebPermission(pendingRequest: PendingWebPermissionRequest) {
+        pendingWebPermission = pendingRequest
+        val missingPermissions = pendingRequest.androidPermissions.filter { permission ->
+            ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missingPermissions.isEmpty()) {
+            pendingWebPermission = null
+            pendingRequest.request.grant(pendingRequest.resources.toTypedArray())
+            return
+        }
+
+        webPermissionLauncher.launch(missingPermissions.toTypedArray())
+    }
+
+    private fun isTrustedSiteOrigin(origin: Uri): Boolean {
+        val originHost = origin.host.orEmpty()
+        val configuredHost = Uri.parse(preferences.targetUrl).host.orEmpty()
+        if (originHost.isBlank() || configuredHost.isBlank()) {
+            return false
+        }
+        return isSameDomain(originHost, configuredHost)
+    }
+
+    private fun buildPermissionRequestMessage(pendingRequest: PendingWebPermissionRequest): String {
+        val originLabel = pendingRequest.origin.host?.takeIf { it.isNotBlank() }
+            ?: pendingRequest.origin.toString()
+        val requestedFeatures = pendingRequest.resources.joinToString("、") { resource ->
+            when (resource) {
+                PermissionRequest.RESOURCE_VIDEO_CAPTURE -> "相机"
+                PermissionRequest.RESOURCE_AUDIO_CAPTURE -> "麦克风"
+                else -> resource
+            }
+        }
+        return "$originLabel 请求访问：$requestedFeatures"
+    }
+
     private fun notifyInitialPageFinished() {
         if (initialPageFinished) {
             return
@@ -376,6 +501,21 @@ private object WebViewProxySession {
     }
 }
 
+private data class PendingWebPermissionRequest(
+    val request: PermissionRequest,
+    val origin: Uri,
+    val resources: List<String>,
+    val androidPermissions: List<String>,
+)
+
+private fun toAndroidPermission(resource: String): String? {
+    return when (resource) {
+        PermissionRequest.RESOURCE_VIDEO_CAPTURE -> Manifest.permission.CAMERA
+        PermissionRequest.RESOURCE_AUDIO_CAPTURE -> Manifest.permission.RECORD_AUDIO
+        else -> null
+    }
+}
+
 private fun WebView.applyBrowserSettings(backgroundColor: Int, supportsMultipleWindows: Boolean) {
     setBackgroundColor(backgroundColor)
     settings.javaScriptEnabled = true
@@ -414,6 +554,11 @@ private fun AppCompatActivity.applySystemBarColor(color: Int) {
     val useDarkIcons = ColorUtils.calculateLuminance(color) > 0.5
     controller.isAppearanceLightStatusBars = useDarkIcons
     controller.isAppearanceLightNavigationBars = useDarkIcons
+}
+
+internal fun isSameDomain(host1: String, host2: String): Boolean {
+    if (host1 == host2) return true
+    return host1.endsWith(".$host2") || host2.endsWith(".$host1")
 }
 
 private fun extractUploadUris(resultCode: Int, data: Intent?): Array<Uri>? {

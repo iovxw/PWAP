@@ -71,8 +71,3 @@ class PureWebViewActivity : BaseWebViewHostActivity() {
         }
     }
 }
-
-private fun isSameDomain(host1: String, host2: String): Boolean {
-    if (host1 == host2) return true
-    return host1.endsWith(".$host2") || host2.endsWith(".$host1")
-}
