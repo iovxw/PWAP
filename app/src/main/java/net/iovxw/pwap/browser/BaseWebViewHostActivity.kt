@@ -1,12 +1,16 @@
 package net.iovxw.pwap.browser
 
 import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.ActivityNotFoundException
+import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.os.Message
+import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -15,7 +19,9 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.ProgressBar
+import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.ColorUtils
@@ -46,10 +52,31 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
     private var appliedProxyPort = 0
     private var initialUrlLoaded = false
     private var initialPageFinished = false
+    private var pendingFileChooserCallback: ValueCallback<Array<Uri>>? = null
 
     private val fallbackSystemBarColor: Int by lazy(LazyThreadSafetyMode.NONE) {
         ContextCompat.getColor(this, R.color.splash_background)
     }
+    private val fileChooserLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            val callback = pendingFileChooserCallback ?: return@registerForActivityResult
+            pendingFileChooserCallback = null
+
+            val uris = extractUploadUris(
+                result.resultCode,
+                result.data
+            )
+            val acceptedUris = uris
+                ?.mapNotNull { sanitizeUploadUri(result.data, it) }
+                ?.distinct()
+                ?.takeIf { it.isNotEmpty() }
+                ?.toTypedArray()
+
+            if (result.resultCode == Activity.RESULT_OK && acceptedUris == null) {
+                Toast.makeText(this, "所选文件无法访问", Toast.LENGTH_SHORT).show()
+            }
+            callback.onReceiveValue(acceptedUris)
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -98,6 +125,8 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        pendingFileChooserCallback?.onReceiveValue(null)
+        pendingFileChooserCallback = null
         if (::webView.isInitialized) {
             webView.stopLoading()
             webView.destroy()
@@ -217,6 +246,33 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                 progressBar.progress = newProgress
                 progressBar.isVisible = newProgress < 100
+            }
+
+            override fun onShowFileChooser(
+                webView: WebView?,
+                filePathCallback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?
+            ): Boolean {
+                if (filePathCallback == null || fileChooserParams == null) {
+                    return false
+                }
+
+                pendingFileChooserCallback?.onReceiveValue(null)
+                pendingFileChooserCallback = filePathCallback
+
+                return try {
+                    fileChooserLauncher.launch(fileChooserParams.createIntent())
+                    true
+                } catch (_: ActivityNotFoundException) {
+                    pendingFileChooserCallback = null
+                    filePathCallback.onReceiveValue(null)
+                    Toast.makeText(
+                        this@BaseWebViewHostActivity,
+                        "系统未找到可用的文件选择器",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    false
+                }
             }
 
             override fun onCreateWindow(
@@ -358,6 +414,58 @@ private fun AppCompatActivity.applySystemBarColor(color: Int) {
     val useDarkIcons = ColorUtils.calculateLuminance(color) > 0.5
     controller.isAppearanceLightStatusBars = useDarkIcons
     controller.isAppearanceLightNavigationBars = useDarkIcons
+}
+
+private fun extractUploadUris(resultCode: Int, data: Intent?): Array<Uri>? {
+    if (resultCode != Activity.RESULT_OK) {
+        return null
+    }
+
+    val uris = buildList {
+        val clipData = data?.clipData
+        if (clipData != null) {
+            for (index in 0 until clipData.itemCount) {
+                clipData.getItemAt(index).uri?.let(::add)
+            }
+        }
+        data?.data?.let(::add)
+        if (isEmpty()) {
+            addAll(WebChromeClient.FileChooserParams.parseResult(resultCode, data).orEmpty())
+        }
+    }
+
+    return uris.takeIf { it.isNotEmpty() }?.toTypedArray()
+}
+
+private fun AppCompatActivity.sanitizeUploadUri(resultData: Intent?, uri: Uri): Uri? {
+    return when (uri.scheme) {
+        "content" -> {
+            if (uri.authority.isNullOrBlank()) {
+                return null
+            }
+            maybeTakePersistableReadPermission(resultData, uri)
+            uri
+        }
+        "file" -> {
+            val path = uri.path?.takeIf { it.isNotBlank() } ?: return null
+            val file = java.io.File(path)
+            if (file.isFile && file.canRead()) uri else null
+        }
+        else -> null
+    }
+}
+
+private fun AppCompatActivity.maybeTakePersistableReadPermission(resultData: Intent?, uri: Uri) {
+    val flags = resultData?.flags ?: return
+    val hasReadPermission = flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0
+    val hasPersistablePermission = flags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION != 0
+    if (!hasReadPermission || !hasPersistablePermission) {
+        return
+    }
+
+    runCatching {
+        contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
 }
 
 private const val THEME_COLOR_SCRIPT = """
