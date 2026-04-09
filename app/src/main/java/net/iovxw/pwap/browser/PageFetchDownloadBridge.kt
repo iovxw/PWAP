@@ -242,6 +242,10 @@ internal class PageFetchDownloadBridge(
 internal object PageFetchDownloadStore {
     private val lock = Any()
     private val sessions = linkedMapOf<String, ActiveBridgeDownload>()
+    // Workaround: canceled progress notifications can be re-posted by late notification updates,
+    // so keep their ids suppressed briefly and cancel them again during subsequent refreshes.
+    private val suppressedNotificationIds = linkedMapOf<Int, Long>()
+    private val notificationCleanupHandler = Handler(Looper.getMainLooper())
 
     fun beginDownload(
         context: Context,
@@ -258,9 +262,11 @@ internal object PageFetchDownloadStore {
                 ?: throw IOException("无法写入下载文件")
             val downloadId = UUID.randomUUID().toString()
             val notificationId = nextNotificationId.incrementAndGet()
+            val now = SystemClock.elapsedRealtime()
 
             synchronized(lock) {
                 sessions[downloadId] = ActiveBridgeDownload(
+                    downloadId = downloadId,
                     notificationId = notificationId,
                     fileName = metadata.fileName,
                     mimeType = metadata.mimeType,
@@ -268,13 +274,17 @@ internal object PageFetchDownloadStore {
                     outputUri = outputUri,
                     outputStream = outputStream,
                     downloadedBytes = 0L,
+                    startedAt = now,
+                    lastSpeedSampleAt = now,
+                    lastSpeedSampleBytes = 0L,
+                    speedBytesPerSecond = 0L,
                     lastNotifiedPercent = -1,
                     lastNotificationAt = 0L
                 )
             }
 
             WebDownloadService.ensureForeground(context)
-            updateForegroundNotification(context)
+            notifyActiveNotifications(context)
 
             Log.d(
                 DOWNLOAD_LOG_TAG,
@@ -289,33 +299,48 @@ internal object PageFetchDownloadStore {
 
     fun appendChunk(context: Context, downloadId: String, base64Chunk: String): Boolean {
         return runCatching {
-            val shouldNotify = synchronized(lock) {
-                val session = sessions[downloadId] ?: return false
-                val bytes = Base64.decode(base64Chunk, Base64.DEFAULT)
+            val session = synchronized(lock) {
+                sessions[downloadId]
+            } ?: return false
+            val bytes = Base64.decode(base64Chunk, Base64.DEFAULT)
+            val shouldNotify = synchronized(session.ioLock) {
+                if (!isActiveSession(downloadId, session)) {
+                    return false
+                }
                 session.outputStream.write(bytes)
-                session.downloadedBytes += bytes.size
-
-                val percent = if (session.totalBytes > 0) {
-                    ((session.downloadedBytes * 100) / session.totalBytes).toInt().coerceIn(0, 100)
-                } else {
-                    -1
-                }
-                val now = SystemClock.elapsedRealtime()
-                val notify = percent != session.lastNotifiedPercent ||
-                    now - session.lastNotificationAt >= PROGRESS_UPDATE_INTERVAL_MS
-                if (notify) {
-                    session.lastNotifiedPercent = percent
-                    session.lastNotificationAt = now
-                }
-                notify
+                updateProgressState(session, bytes.size)
             }
 
             if (shouldNotify) {
-                updateForegroundNotification(context)
+                notifyActiveNotifications(context)
             }
             true
         }.getOrElse { error ->
             Log.e(DOWNLOAD_LOG_TAG, "append chunk failed for $downloadId", error)
+            failDownload(context, downloadId, error.message ?: "写入下载内容失败")
+            false
+        }
+    }
+
+    fun appendBytes(context: Context, downloadId: String, bytes: ByteArray, length: Int): Boolean {
+        return runCatching {
+            val session = synchronized(lock) {
+                sessions[downloadId]
+            } ?: return false
+            val shouldNotify = synchronized(session.ioLock) {
+                if (!isActiveSession(downloadId, session)) {
+                    return false
+                }
+                session.outputStream.write(bytes, 0, length)
+                updateProgressState(session, length)
+            }
+
+            if (shouldNotify) {
+                notifyActiveNotifications(context)
+            }
+            true
+        }.getOrElse { error ->
+            Log.e(DOWNLOAD_LOG_TAG, "append bytes failed for $downloadId", error)
             failDownload(context, downloadId, error.message ?: "写入下载内容失败")
             false
         }
@@ -327,8 +352,10 @@ internal object PageFetchDownloadStore {
         } ?: return false
 
         return runCatching {
-            session.outputStream.flush()
-            session.outputStream.close()
+            synchronized(session.ioLock) {
+                session.outputStream.flush()
+                session.outputStream.close()
+            }
             finalizeDownloadUri(context, session.outputUri)
             postCompletionNotification(context, session)
             Log.d(DOWNLOAD_LOG_TAG, "finish downloadId=$downloadId uri=${session.outputUri}")
@@ -349,7 +376,9 @@ internal object PageFetchDownloadStore {
         } ?: return false
 
         return runCatching {
-            session.outputStream.close()
+            synchronized(session.ioLock) {
+                session.outputStream.close()
+            }
         }.also {
             deleteDownloadUri(context, session.outputUri)
             postFailureNotification(context, session.notificationId, message)
@@ -358,48 +387,66 @@ internal object PageFetchDownloadStore {
         }.isSuccess
     }
 
-    fun buildForegroundNotification(context: Context): Notification? {
-        val snapshot = synchronized(lock) {
-            sessions.values.map {
-                ActiveBridgeDownloadSnapshot(
-                    fileName = it.fileName,
-                    downloadedBytes = it.downloadedBytes,
-                    totalBytes = it.totalBytes
-                )
+    fun cancelDownload(context: Context, downloadId: String): Boolean {
+        val session = synchronized(lock) {
+            sessions.remove(downloadId)
+        } ?: return false
+
+        suppressNotification(context, session.notificationId)
+        return runCatching {
+            synchronized(session.ioLock) {
+                session.outputStream.close()
             }
+        }.also {
+            deleteDownloadUri(context, session.outputUri)
+            Log.i(DOWNLOAD_LOG_TAG, "cancel downloadId=$downloadId")
+            val hasRemainingSessions = synchronized(lock) {
+                sessions.isNotEmpty()
+            }
+            if (hasRemainingSessions) {
+                WebDownloadService.ensureForeground(context)
+                notifyActiveNotifications(context)
+            } else {
+                context.stopService(Intent(context, WebDownloadService::class.java))
+            }
+        }.isSuccess
+    }
+
+    fun dismissOrphanNotification(context: Context, notificationId: Int) {
+        suppressNotification(context, notificationId)
+    }
+
+    fun buildForegroundNotification(context: Context): ActiveDownloadNotification? {
+        val session = synchronized(lock) {
+            sessions.values.firstOrNull()
         }
-        if (snapshot.isEmpty()) {
+        val snapshot = session?.toSnapshot()
+        if (snapshot == null || !hasActiveSession(snapshot.downloadId, snapshot.notificationId)) {
             return null
         }
+        return ActiveDownloadNotification(
+            notificationId = snapshot.notificationId,
+            notification = buildActiveNotification(context, snapshot)
+        )
+    }
 
-        val builder = NotificationCompat.Builder(context, ACTIVE_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setOnlyAlertOnce(true)
-            .setOngoing(true)
-            .setSilent(true)
-            .setCategory(NotificationCompat.CATEGORY_PROGRESS)
-
-        createAppPendingIntent(context)?.let(builder::setContentIntent)
-
-        val current = snapshot.first()
-        if (snapshot.size == 1) {
-            builder.setContentTitle(current.fileName)
-                .setContentText(buildProgressText(context, current))
-            if (current.totalBytes > 0) {
-                val percent = ((current.downloadedBytes * 100) / current.totalBytes)
-                    .toInt()
-                    .coerceIn(0, 100)
-                builder.setProgress(100, percent, false)
-            } else {
-                builder.setProgress(0, 0, true)
-            }
-        } else {
-            builder.setContentTitle("正在下载 ${snapshot.size} 个文件")
-                .setContentText(snapshot.joinToString(limit = 2, truncated = "等") { it.fileName })
-                .setProgress(0, 0, true)
+    fun notifyActiveNotifications(context: Context) {
+        val activeSessions = synchronized(lock) {
+            sessions.values.toList()
         }
-
-        return builder.build()
+        val snapshots = activeSessions.map(ActiveBridgeDownload::toSnapshot)
+        val notificationManager = context.getSystemService(NotificationManager::class.java)
+        cancelSuppressedNotifications(context)
+        snapshots.forEach { snapshot ->
+            if (!hasActiveSession(snapshot.downloadId, snapshot.notificationId)) {
+                return@forEach
+            }
+            notificationManager.notify(
+                snapshot.notificationId,
+                buildActiveNotification(context, snapshot)
+            )
+        }
+        cancelSuppressedNotifications(context)
     }
 
     private fun onSessionFinished(context: Context) {
@@ -409,13 +456,8 @@ internal object PageFetchDownloadStore {
                 return
             }
         }
-        updateForegroundNotification(context)
-    }
-
-    private fun updateForegroundNotification(context: Context) {
-        val notification = buildForegroundNotification(context) ?: return
-        context.getSystemService(NotificationManager::class.java)
-            .notify(WebDownloadService.FOREGROUND_NOTIFICATION_ID, notification)
+        WebDownloadService.ensureForeground(context)
+        notifyActiveNotifications(context)
     }
 
     private fun ensureNotificationChannels(context: Context) {
@@ -465,6 +507,121 @@ internal object PageFetchDownloadStore {
         }
     }
 
+    private fun suppressNotification(context: Context, notificationId: Int) {
+        val expiresAt = SystemClock.elapsedRealtime() + SUPPRESSED_NOTIFICATION_WINDOW_MS
+        synchronized(lock) {
+            suppressedNotificationIds[notificationId] = expiresAt
+        }
+        cancelSuppressedNotifications(context)
+        SUPPRESSED_NOTIFICATION_CANCEL_DELAYS_MS.forEach { delayMs ->
+            notificationCleanupHandler.postDelayed(
+                { cancelSuppressedNotifications(context.applicationContext) },
+                delayMs
+            )
+        }
+    }
+
+    private fun cancelSuppressedNotifications(context: Context) {
+        val now = SystemClock.elapsedRealtime()
+        val suppressedIds = synchronized(lock) {
+            val iterator = suppressedNotificationIds.entries.iterator()
+            while (iterator.hasNext()) {
+                if (iterator.next().value <= now) {
+                    iterator.remove()
+                }
+            }
+            suppressedNotificationIds.keys.toList()
+        }
+        if (suppressedIds.isEmpty()) {
+            return
+        }
+        val notificationManager = context.getSystemService(NotificationManager::class.java)
+        suppressedIds.forEach(notificationManager::cancel)
+        notificationManager.cancel(AUTO_GROUP_SUMMARY_NOTIFICATION_ID)
+    }
+
+    private fun isActiveSession(downloadId: String, session: ActiveBridgeDownload): Boolean {
+        return synchronized(lock) {
+            sessions[downloadId] === session
+        }
+    }
+
+    private fun hasActiveSession(downloadId: String, notificationId: Int): Boolean {
+        return synchronized(lock) {
+            sessions[downloadId]?.notificationId == notificationId
+        }
+    }
+
+    private fun updateProgressState(session: ActiveBridgeDownload, bytesWritten: Int): Boolean {
+        session.downloadedBytes += bytesWritten
+        val now = SystemClock.elapsedRealtime()
+        val elapsedSinceSample = now - session.lastSpeedSampleAt
+        if (elapsedSinceSample >= SPEED_SAMPLE_INTERVAL_MS) {
+            val deltaBytes = session.downloadedBytes - session.lastSpeedSampleBytes
+            session.speedBytesPerSecond = if (elapsedSinceSample > 0) {
+                (deltaBytes * 1000L) / elapsedSinceSample
+            } else {
+                0L
+            }
+            session.lastSpeedSampleAt = now
+            session.lastSpeedSampleBytes = session.downloadedBytes
+        } else {
+            val totalElapsed = now - session.startedAt
+            if (totalElapsed > 0) {
+                session.speedBytesPerSecond = (session.downloadedBytes * 1000L) / totalElapsed
+            }
+        }
+        val percent = if (session.totalBytes > 0) {
+            ((session.downloadedBytes * 100) / session.totalBytes).toInt().coerceIn(0, 100)
+        } else {
+            -1
+        }
+        val notify = percent != session.lastNotifiedPercent ||
+            now - session.lastNotificationAt >= PROGRESS_UPDATE_INTERVAL_MS
+        if (notify) {
+            session.lastNotifiedPercent = percent
+            session.lastNotificationAt = now
+        }
+        return notify
+    }
+
+    private fun buildActiveNotification(
+        context: Context,
+        download: ActiveBridgeDownloadSnapshot
+    ): Notification {
+        val builder = NotificationCompat.Builder(context, ACTIVE_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+            .setSilent(true)
+            .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+            // Workaround: give each active download a distinct group key to reduce framework
+            // auto-grouping of our silent progress notifications on this device.
+            .setGroup("$ACTIVE_NOTIFICATION_GROUP_PREFIX${download.downloadId}")
+            .setContentTitle(download.fileName)
+            .setContentText(buildProgressText(context, download))
+            .addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "取消",
+                WebDownloadService.createCancelPendingIntent(
+                    context = context,
+                    downloadId = download.downloadId,
+                    requestCode = download.notificationId
+                )
+            )
+
+        if (download.totalBytes > 0) {
+            val percent = ((download.downloadedBytes * 100) / download.totalBytes)
+                .toInt()
+                .coerceIn(0, 100)
+            builder.setProgress(100, percent, false)
+        } else {
+            builder.setProgress(0, 0, true)
+        }
+
+        return builder.build()
+    }
+
     private fun postCompletionNotification(context: Context, session: ActiveBridgeDownload) {
         val openIntent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(session.outputUri, session.mimeType.ifBlank { DEFAULT_MIME_TYPE })
@@ -506,12 +663,16 @@ internal object PageFetchDownloadStore {
     }
 
     private fun buildProgressText(context: Context, download: ActiveBridgeDownloadSnapshot): String {
-        return if (download.totalBytes > 0) {
+        val progressText = if (download.totalBytes > 0) {
             "${Formatter.formatShortFileSize(context, download.downloadedBytes)} / " +
                 Formatter.formatShortFileSize(context, download.totalBytes)
         } else {
             "已下载 ${Formatter.formatShortFileSize(context, download.downloadedBytes)}"
         }
+        val speedText = download.speedBytesPerSecond
+            .takeIf { it > 0L }
+            ?.let { "${Formatter.formatShortFileSize(context, it)}/s" }
+        return listOfNotNull(progressText, speedText).joinToString(" · ")
     }
 }
 
@@ -550,6 +711,7 @@ private data class BridgeDownloadMetadata(
 }
 
 private data class ActiveBridgeDownload(
+    val downloadId: String,
     val notificationId: Int,
     var fileName: String,
     var mimeType: String,
@@ -557,14 +719,40 @@ private data class ActiveBridgeDownload(
     val outputUri: Uri,
     val outputStream: OutputStream,
     var downloadedBytes: Long,
+    val startedAt: Long,
+    var lastSpeedSampleAt: Long,
+    var lastSpeedSampleBytes: Long,
+    var speedBytesPerSecond: Long,
     var lastNotifiedPercent: Int,
     var lastNotificationAt: Long,
-)
+    val ioLock: Any = Any(),
+) {
+    fun toSnapshot(): ActiveBridgeDownloadSnapshot {
+        return synchronized(ioLock) {
+            ActiveBridgeDownloadSnapshot(
+                downloadId = downloadId,
+                notificationId = notificationId,
+                fileName = fileName,
+                downloadedBytes = downloadedBytes,
+                totalBytes = totalBytes,
+                speedBytesPerSecond = speedBytesPerSecond
+            )
+        }
+    }
+}
 
 private data class ActiveBridgeDownloadSnapshot(
+    val downloadId: String,
+    val notificationId: Int,
     val fileName: String,
     val downloadedBytes: Long,
     val totalBytes: Long,
+    val speedBytesPerSecond: Long,
+)
+
+internal data class ActiveDownloadNotification(
+    val notificationId: Int,
+    val notification: Notification,
 )
 
 private fun OutputStream.buffered(): OutputStream = BufferedOutputStream(this)
@@ -629,6 +817,11 @@ private const val COMPLETE_CHANNEL_ID = "download_complete"
 private const val DEFAULT_MIME_TYPE = "application/octet-stream"
 private const val BLOB_RESOLVE_TIMEOUT_MS = 5000L
 private const val PROGRESS_UPDATE_INTERVAL_MS = 750L
+private const val SPEED_SAMPLE_INTERVAL_MS = 1000L
 private const val APP_PENDING_INTENT_REQUEST_CODE = 1002
+private const val ACTIVE_NOTIFICATION_GROUP_PREFIX = "download:"
+private const val AUTO_GROUP_SUMMARY_NOTIFICATION_ID = 1
+private const val SUPPRESSED_NOTIFICATION_WINDOW_MS = 4000L
+private val SUPPRESSED_NOTIFICATION_CANCEL_DELAYS_MS = longArrayOf(250L, 1000L, 2500L)
 
 private val nextNotificationId = AtomicInteger(2_000)
