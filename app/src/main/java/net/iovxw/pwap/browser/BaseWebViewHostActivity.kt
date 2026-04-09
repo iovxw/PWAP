@@ -10,9 +10,12 @@ import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Message
+import android.util.Log
 import android.webkit.PermissionRequest
+import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -34,16 +37,18 @@ import androidx.core.view.isVisible
 import androidx.lifecycle.lifecycleScope
 import androidx.webkit.ProxyConfig
 import androidx.webkit.ProxyController
+import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import java.util.concurrent.Executor
+import java.util.UUID
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import net.iovxw.pwap.R
 import net.iovxw.pwap.data.AppPreferences
 import net.iovxw.pwap.proxy.ProxyManager
+import net.iovxw.pwap.proxy.ProxySessionManager
+import org.json.JSONObject
 
 abstract class BaseWebViewHostActivity : AppCompatActivity() {
     protected lateinit var preferences: AppPreferences
@@ -58,7 +63,12 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
     private var initialPageFinished = false
     private var pendingFileChooserCallback: ValueCallback<Array<Uri>>? = null
     private var pendingWebPermission: PendingWebPermissionRequest? = null
+    private var pendingDownloadRequest: BridgeDownloadRequest? = null
     private var permissionPromptDialog: AlertDialog? = null
+    private val blobHookSecret = UUID.randomUUID().toString()
+    private val pageDownloadBridge by lazy(LazyThreadSafetyMode.NONE) {
+        PageFetchDownloadBridge(applicationContext, blobHookSecret)
+    }
 
     private val fallbackSystemBarColor: Int by lazy(LazyThreadSafetyMode.NONE) {
         ContextCompat.getColor(this, R.color.splash_background)
@@ -98,6 +108,19 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
                 Toast.makeText(this, "系统权限被拒绝", Toast.LENGTH_SHORT).show()
             }
         }
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            val pendingRequest = pendingDownloadRequest ?: return@registerForActivityResult
+            pendingDownloadRequest = null
+            if (!granted) {
+                Toast.makeText(
+                    this,
+                    "未授予通知权限，后台下载通知可能不可见",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+            startPendingDownload(pendingRequest)
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -124,6 +147,8 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
         progressBar.isVisible = false
 
         webView.applyBrowserSettings(fallbackSystemBarColor, supportsMultipleWindows = true)
+        webView.addJavascriptInterface(pageDownloadBridge, JS_DOWNLOAD_BRIDGE_NAME)
+        installBlobDownloadHook()
         bindWebView()
 
         onBackPressedDispatcher.addCallback(
@@ -140,7 +165,7 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
         )
 
         lifecycleScope.launch {
-            WebViewProxySession.acquire(preferences.proxyConfig, preferences.dnsServer)
+            ProxySessionManager.acquire(preferences.proxyConfig, preferences.dnsServer)
         }
         observeProxyAndLoad()
     }
@@ -152,12 +177,14 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
         permissionPromptDialog = null
         pendingWebPermission?.request?.deny()
         pendingWebPermission = null
+        pendingDownloadRequest = null
+        pageDownloadBridge.abortAll("页面已关闭，下载已取消")
         if (::webView.isInitialized) {
             webView.stopLoading()
             webView.destroy()
         }
         lifecycleScope.launch {
-            WebViewProxySession.release()
+            ProxySessionManager.release()
         }
         super.onDestroy()
     }
@@ -264,6 +291,17 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
                 if (request?.isForMainFrame == true) {
                     notifyInitialPageFinished()
                 }
+            }
+        }
+        webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, contentLength ->
+            runOnUiThread {
+                handleDownloadRequest(
+                    url = url,
+                    userAgent = userAgent,
+                    contentDisposition = contentDisposition,
+                    mimeType = mimeType,
+                    contentLength = contentLength
+                )
             }
         }
 
@@ -440,6 +478,95 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
         return "$originLabel 请求访问：$requestedFeatures"
     }
 
+    private fun handleDownloadRequest(
+        url: String?,
+        userAgent: String?,
+        contentDisposition: String?,
+        mimeType: String?,
+        contentLength: Long
+    ) {
+        val downloadUrl = url?.trim().orEmpty()
+        val scheme = runCatching { Uri.parse(downloadUrl).scheme.orEmpty().lowercase() }.getOrNull()
+        Log.d(
+            DOWNLOAD_LOG_TAG,
+            "download request url=$downloadUrl scheme=$scheme mimeType=${mimeType.orEmpty()} " +
+                "contentDisposition=${contentDisposition.orEmpty()} contentLength=$contentLength"
+        )
+        if (scheme !in setOf("http", "https", "blob", "data")) {
+            Log.w(DOWNLOAD_LOG_TAG, "unsupported download scheme: $scheme")
+            Toast.makeText(this, "暂不支持该下载类型", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val pendingRequest = BridgeDownloadRequest(
+            url = downloadUrl,
+            contentDisposition = contentDisposition.orEmpty(),
+            mimeType = mimeType.orEmpty(),
+            contentLength = contentLength,
+            suggestedFileName = URLUtil.guessFileName(
+                downloadUrl,
+                contentDisposition?.takeIf { it.isNotBlank() },
+                mimeType?.takeIf { it.isNotBlank() }
+            )
+        )
+
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingDownloadRequest = pendingRequest
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            return
+        }
+
+        startPendingDownload(pendingRequest)
+    }
+
+    private fun startPendingDownload(request: BridgeDownloadRequest) {
+        val scheme = runCatching { Uri.parse(request.url).scheme.orEmpty().lowercase() }.getOrDefault("")
+        if (scheme == "blob") {
+            startBlobResolveDownload(request)
+        } else {
+            startJavascriptDownload(request)
+        }
+    }
+
+    private fun startJavascriptDownload(request: BridgeDownloadRequest) {
+        val requestToken = pageDownloadBridge.prepareRequest(request)
+        val script = buildFetchDownloadScript(request, requestToken)
+        webView.evaluateJavascript(script, null)
+        Toast.makeText(this, "已开始下载", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun startBlobResolveDownload(request: BridgeDownloadRequest) {
+        val requestId = pageDownloadBridge.prepareBlobResolveRequest(request)
+        val script = buildBlobResolveDispatchScript(request, requestId, blobHookSecret)
+        webView.evaluateJavascript(script) { rawValue ->
+            if (rawValue != "true") {
+                pageDownloadBridge.failPendingBlobResolveRequest(
+                    requestId,
+                    "当前页面未安装 Blob 下载桥接"
+                )
+            }
+        }
+        Toast.makeText(this, "已开始下载", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun installBlobDownloadHook() {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            Log.w(DOWNLOAD_LOG_TAG, "DOCUMENT_START_SCRIPT not supported")
+            return
+        }
+        WebViewCompat.addDocumentStartJavaScript(
+            webView,
+            buildBlobInterceptScript(blobHookSecret),
+            setOf("*")
+        )
+    }
+
     private fun notifyInitialPageFinished() {
         if (initialPageFinished) {
             return
@@ -452,52 +579,6 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
         val resolvedColor = themeColor ?: fallbackSystemBarColor
         hostRoot.setBackgroundColor(resolvedColor)
         applySystemBarColor(resolvedColor)
-    }
-}
-
-private object WebViewProxySession {
-    private val mutex = Mutex()
-
-    private var activeHosts = 0
-    private var currentConfig: Pair<String, String>? = null
-
-    suspend fun acquire(proxyConfig: String, dnsServer: String) {
-        val requestedConfig = proxyConfig to dnsServer
-        mutex.withLock {
-            activeHosts += 1
-
-            val sameConfig = currentConfig == requestedConfig
-            val state = ProxyManager.state.value
-            if (sameConfig && (state == ProxyManager.ProxyState.STARTING || ProxyManager.isRunning)) {
-                return@withLock
-            }
-
-            currentConfig = requestedConfig
-            ProxyManager.start(proxyConfig, dnsServer)
-        }
-    }
-
-    suspend fun release() {
-        mutex.withLock {
-            if (activeHosts > 0) {
-                activeHosts -= 1
-            }
-            if (activeHosts != 0) {
-                return@withLock
-            }
-
-            currentConfig = null
-            if (WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
-                try {
-                    ProxyController.getInstance().clearProxyOverride(
-                        Executor { it.run() },
-                        {}
-                    )
-                } catch (_: Exception) {
-                }
-            }
-            ProxyManager.stop()
-        }
     }
 }
 
@@ -612,6 +693,432 @@ private fun AppCompatActivity.maybeTakePersistableReadPermission(resultData: Int
         contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
 }
+
+private fun buildFetchDownloadScript(request: BridgeDownloadRequest, requestToken: String): String {
+    return """
+        (async () => {
+          const request = {
+            url: ${request.url.toJsString()},
+            contentDisposition: ${request.contentDisposition.toJsString()},
+            mimeType: ${request.mimeType.toJsString()},
+            contentLength: ${request.contentLength},
+            suggestedFileName: ${request.suggestedFileName.toJsString()}
+          };
+          const requestToken = ${requestToken.toJsString()};
+          const bridge = window.${JS_DOWNLOAD_BRIDGE_NAME};
+          let downloadId = '';
+
+          function bytesToBase64(bytes) {
+            let binary = '';
+            const chunkSize = 0x8000;
+            for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+              const chunk = bytes.subarray(offset, offset + chunkSize);
+              binary += String.fromCharCode(...chunk);
+            }
+            return btoa(binary);
+          }
+
+          try {
+            const response = await fetch(request.url, {
+              credentials: 'include',
+              cache: 'force-cache'
+            });
+            if (!response.ok) {
+              throw new Error(`HTTP ${'$'}{response.status} ${'$'}{response.statusText}`.trim());
+            }
+
+            downloadId = bridge.beginDownload(requestToken, JSON.stringify({
+              url: request.url,
+              finalUrl: response.url || request.url,
+              contentDisposition: response.headers.get('Content-Disposition') || request.contentDisposition,
+              mimeType: response.headers.get('Content-Type') || request.mimeType,
+              contentLength: Number(response.headers.get('Content-Length') || '') || request.contentLength || -1,
+              suggestedFileName: request.suggestedFileName
+            }));
+            if (!downloadId) {
+              throw new Error('native beginDownload failed');
+            }
+
+            const reader = response.body && response.body.getReader ? response.body.getReader() : null;
+            if (reader) {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (value && value.length) {
+                  if (!bridge.appendChunk(downloadId, bytesToBase64(value))) {
+                    throw new Error('native appendChunk failed');
+                  }
+                }
+              }
+            } else {
+              const buffer = await response.arrayBuffer();
+              const bytes = new Uint8Array(buffer);
+              for (let offset = 0; offset < bytes.length; offset += 65536) {
+                const chunk = bytes.subarray(offset, offset + 65536);
+                if (!bridge.appendChunk(downloadId, bytesToBase64(chunk))) {
+                  throw new Error('native appendChunk failed');
+                }
+              }
+            }
+
+            if (!bridge.finishDownload(downloadId)) {
+              throw new Error('native finishDownload failed');
+            }
+          } catch (error) {
+            const message = error && error.message ? error.message : String(error);
+            if (downloadId) {
+              bridge.failDownload(downloadId, message);
+            } else {
+              bridge.reportError(requestToken, message);
+            }
+          }
+        })();
+    """.trimIndent()
+}
+
+private fun buildBlobResolveDispatchScript(
+    request: BridgeDownloadRequest,
+    requestId: String,
+    blobHookSecret: String
+): String {
+    return """
+        (() => {
+          const dispatcher = window.__pwapDispatchBlobResolve;
+          if (typeof dispatcher !== 'function') {
+            return false;
+          }
+          return !!dispatcher(JSON.stringify({
+            secret: ${blobHookSecret.toJsString()},
+            type: 'resolve-blob-download',
+            requestId: ${requestId.toJsString()},
+            url: ${request.url.toJsString()},
+            contentDisposition: ${request.contentDisposition.toJsString()},
+            mimeType: ${request.mimeType.toJsString()},
+            contentLength: ${request.contentLength},
+            suggestedFileName: ${request.suggestedFileName.toJsString()}
+          }));
+        })();
+    """.trimIndent()
+}
+
+private fun buildBlobInterceptScript(blobHookSecret: String): String {
+    return """
+        (() => {
+          if (window.__pwapBlobInterceptInstalled) return;
+          window.__pwapBlobInterceptInstalled = true;
+
+          const secret = ${blobHookSecret.toJsString()};
+          const bridge = window.${JS_DOWNLOAD_BRIDGE_NAME};
+          const objectUrls = new Map();
+          const handledResolveRequests = new Set();
+          let lastTrustedEventAt = 0;
+
+          bridge.debugIntercept(secret, `installed origin=${'$'}{location.origin} href=${'$'}{location.href}`);
+
+          const markTrustedEvent = (event) => {
+            if (event && event.isTrusted) {
+              lastTrustedEventAt = Date.now();
+            }
+          };
+
+          document.addEventListener('pointerdown', markTrustedEvent, true);
+          document.addEventListener('click', markTrustedEvent, true);
+          document.addEventListener('keydown', markTrustedEvent, true);
+
+          const originalCreateObjectURL = URL.createObjectURL.bind(URL);
+          const originalRevokeObjectURL = URL.revokeObjectURL.bind(URL);
+          const originalAnchorClick = HTMLAnchorElement.prototype.click;
+          const originalWindowOpen = typeof window.open === 'function' ? window.open.bind(window) : null;
+          const originalLocationAssign = typeof Location !== 'undefined' && Location.prototype.assign ? Location.prototype.assign : null;
+          const originalLocationReplace = typeof Location !== 'undefined' && Location.prototype.replace ? Location.prototype.replace : null;
+
+          URL.createObjectURL = function(value) {
+            const url = originalCreateObjectURL(value);
+            try {
+              if (value instanceof Blob) {
+                // Preferred path is to resolve Blob downloads on demand from the
+                // owning frame. A fallback would be to stream every createObjectURL()
+                // Blob to native immediately, but that stays only as a reserve option.
+                objectUrls.set(url, value);
+                bridge.debugIntercept(secret, `createObjectURL url=${'$'}{url} size=${'$'}{value.size || -1} type=${'$'}{value.type || ''} origin=${'$'}{location.origin}`);
+              }
+            } catch (error) {
+            }
+            return url;
+          };
+
+          URL.revokeObjectURL = function(url) {
+            const revoke = () => {
+              objectUrls.delete(url);
+              originalRevokeObjectURL(url);
+            };
+            if (objectUrls.has(url)) {
+              setTimeout(revoke, 30000);
+            } else {
+              revoke();
+            }
+          };
+
+          function bytesToBase64(bytes) {
+            let binary = '';
+            const chunkSize = 0x8000;
+            for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+              const chunk = bytes.subarray(offset, offset + chunkSize);
+              binary += String.fromCharCode(...chunk);
+            }
+            return btoa(binary);
+          }
+
+          function findAnchor(event) {
+            if (event.composedPath) {
+              const path = event.composedPath();
+              for (const item of path) {
+                if (item && item.tagName === 'A' && item.href) {
+                  return item;
+                }
+              }
+            }
+            let current = event.target;
+            while (current && current.nodeType === 1) {
+              if (current.tagName === 'A' && current.href) {
+                return current;
+              }
+              current = current.parentElement;
+            }
+            return null;
+          }
+
+          function rememberResolveRequest(requestId) {
+            if (!requestId) return;
+            handledResolveRequests.add(requestId);
+            setTimeout(() => {
+              handledResolveRequests.delete(requestId);
+            }, 60000);
+          }
+
+          function forwardResolveRequest(payload) {
+            if (!window.frames || !window.frames.length) {
+              return;
+            }
+            for (let index = 0; index < window.frames.length; index += 1) {
+              try {
+                window.frames[index].postMessage({ __pwapBlobResolve: payload }, '*');
+              } catch (error) {
+                bridge.debugIntercept(
+                  secret,
+                  `resolve-forward-failed requestId=${'$'}{payload.requestId || ''} index=${'$'}{index} message=${'$'}{error && error.message ? error.message : String(error)} origin=${'$'}{location.origin}`
+                );
+              }
+            }
+          }
+
+          async function streamBlob(href, blob, suggestedFileName, requestId, sourceLabel) {
+            let downloadId = '';
+            try {
+              bridge.debugIntercept(
+                secret,
+                `stream start requestId=${'$'}{requestId || ''} source=${'$'}{sourceLabel} href=${'$'}{href} size=${'$'}{typeof blob.size === 'number' ? blob.size : -1} origin=${'$'}{location.origin}`
+              );
+              downloadId = bridge.beginInterceptedBlobDownload(secret, requestId || '', JSON.stringify({
+                url: href,
+                finalUrl: href,
+                contentDisposition: '',
+                mimeType: blob.type || '',
+                contentLength: typeof blob.size === 'number' ? blob.size : -1,
+                suggestedFileName: suggestedFileName || ''
+              }));
+              if (downloadId === ${BLOB_RESOLVE_MISSING_SENTINEL.toJsString()}) {
+                bridge.debugIntercept(
+                  secret,
+                  `stream skipped requestId=${'$'}{requestId || ''} source=${'$'}{sourceLabel} href=${'$'}{href} origin=${'$'}{location.origin}`
+                );
+                return;
+              }
+              if (!downloadId) {
+                throw new Error('native beginDownload failed');
+              }
+
+              const reader = blob.stream && blob.stream().getReader ? blob.stream().getReader() : null;
+              if (reader) {
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  if (value && value.length) {
+                    if (!bridge.appendChunk(downloadId, bytesToBase64(value))) {
+                      throw new Error('native appendChunk failed');
+                    }
+                  }
+                }
+              } else {
+                const bytes = new Uint8Array(await blob.arrayBuffer());
+                for (let offset = 0; offset < bytes.length; offset += 65536) {
+                  const chunk = bytes.subarray(offset, offset + 65536);
+                  if (!bridge.appendChunk(downloadId, bytesToBase64(chunk))) {
+                    throw new Error('native appendChunk failed');
+                  }
+                }
+              }
+
+              if (!bridge.finishDownload(downloadId)) {
+                throw new Error('native finishDownload failed');
+              }
+              bridge.debugIntercept(
+                secret,
+                `stream finish requestId=${'$'}{requestId || ''} source=${'$'}{sourceLabel} href=${'$'}{href} origin=${'$'}{location.origin}`
+              );
+            } catch (error) {
+              const message = error && error.message ? error.message : String(error);
+              if (downloadId) {
+                bridge.failDownload(downloadId, message);
+              } else {
+                bridge.reportInterceptedError(secret, message);
+              }
+            }
+          }
+
+          function handleResolveRequest(payload, sourceLabel) {
+            if (!payload || payload.secret !== secret || payload.type !== 'resolve-blob-download') {
+              return false;
+            }
+            const requestId = typeof payload.requestId === 'string' ? payload.requestId : '';
+            if (requestId && handledResolveRequests.has(requestId)) {
+              return false;
+            }
+            rememberResolveRequest(requestId);
+
+            const href = typeof payload.url === 'string' ? payload.url : '';
+            const knownBlob = objectUrls.get(href);
+            bridge.debugIntercept(
+              secret,
+              `resolve requestId=${'$'}{requestId} source=${'$'}{sourceLabel} href=${'$'}{href} known=${'$'}{!!knownBlob} origin=${'$'}{location.origin}`
+            );
+            if (knownBlob) {
+              streamBlob(href, knownBlob, payload.suggestedFileName || '', requestId, sourceLabel);
+            }
+            forwardResolveRequest(payload);
+            return true;
+          }
+
+          function maybeStreamKnownBlob(href, suggestedFileName, sourceLabel) {
+            if (typeof href !== 'string') return false;
+            if (!href.startsWith('blob:')) return false;
+            if (Date.now() - lastTrustedEventAt > 1500) return false;
+
+            const knownBlob = objectUrls.get(href);
+            bridge.debugIntercept(secret, `${'$'}{sourceLabel} href=${'$'}{href} known=${'$'}{!!knownBlob} origin=${'$'}{location.origin}`);
+            if (!knownBlob) return false;
+
+            streamBlob(href, knownBlob, suggestedFileName || '', '', sourceLabel);
+            return true;
+          }
+
+          window.addEventListener('message', (event) => {
+            const payload =
+              event &&
+              event.data &&
+              typeof event.data === 'object' &&
+              event.data.__pwapBlobResolve
+                ? event.data.__pwapBlobResolve
+                : null;
+            if (!payload) {
+              return;
+            }
+            handleResolveRequest(payload, 'frame-message');
+          }, false);
+
+          window.__pwapDispatchBlobResolve = function(payloadJson) {
+            try {
+              const payload = typeof payloadJson === 'string'
+                ? JSON.parse(payloadJson)
+                : payloadJson;
+              return handleResolveRequest(payload, 'native-dispatch');
+            } catch (error) {
+              bridge.debugIntercept(
+                secret,
+                `resolve-dispatch-failed ${'$'}{error && error.message ? error.message : String(error)}`
+              );
+              return false;
+            }
+          };
+
+          document.addEventListener('click', (event) => {
+            const anchor = findAnchor(event);
+            if (!anchor) return;
+            const href = anchor.href || '';
+            if (!href.startsWith('blob:')) return;
+            if (!maybeStreamKnownBlob(href, anchor.getAttribute('download') || '', 'blob-click')) return;
+
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          }, true);
+
+          HTMLAnchorElement.prototype.click = function() {
+            const href = this.href || '';
+            if (maybeStreamKnownBlob(href, this.getAttribute('download') || '', 'anchor.click')) {
+              return;
+            }
+            return originalAnchorClick.call(this);
+          };
+
+          if (originalWindowOpen) {
+            window.open = function(url, ...args) {
+              const href = typeof url === 'string' ? url : String(url ?? '');
+              if (maybeStreamKnownBlob(href, '', 'window.open')) {
+                return null;
+              }
+              return originalWindowOpen(url, ...args);
+            };
+          }
+
+          if (originalLocationAssign) {
+            Location.prototype.assign = function(url) {
+              const href = typeof url === 'string' ? url : String(url ?? '');
+              if (maybeStreamKnownBlob(href, '', 'location.assign')) {
+                return;
+              }
+              return originalLocationAssign.call(this, url);
+            };
+          }
+
+          if (originalLocationReplace) {
+            Location.prototype.replace = function(url) {
+              const href = typeof url === 'string' ? url : String(url ?? '');
+              if (maybeStreamKnownBlob(href, '', 'location.replace')) {
+                return;
+              }
+              return originalLocationReplace.call(this, url);
+            };
+          }
+
+          try {
+            const locationPrototype = Object.getPrototypeOf(window.location);
+            const hrefDescriptor = locationPrototype
+              ? Object.getOwnPropertyDescriptor(locationPrototype, 'href')
+              : null;
+            if (hrefDescriptor && hrefDescriptor.get && hrefDescriptor.set) {
+              Object.defineProperty(locationPrototype, 'href', {
+                configurable: true,
+                enumerable: hrefDescriptor.enumerable,
+                get() {
+                  return hrefDescriptor.get.call(this);
+                },
+                set(value) {
+                  const href = typeof value === 'string' ? value : String(value ?? '');
+                  if (maybeStreamKnownBlob(href, '', 'location.href')) {
+                    return href;
+                  }
+                  return hrefDescriptor.set.call(this, value);
+                }
+              });
+            }
+          } catch (error) {
+            bridge.debugIntercept(secret, `location.href-hook-failed ${'$'}{error && error.message ? error.message : String(error)}`);
+          }
+        })();
+    """.trimIndent()
+}
+
+private fun String.toJsString(): String = JSONObject.quote(this)
 
 private const val THEME_COLOR_SCRIPT = """
 (() => {
