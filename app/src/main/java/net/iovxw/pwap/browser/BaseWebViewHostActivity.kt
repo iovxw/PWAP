@@ -12,8 +12,12 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.Message
 import android.util.Log
+import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
 import android.webkit.PermissionRequest
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
@@ -39,8 +43,14 @@ import androidx.webkit.ProxyConfig
 import androidx.webkit.ProxyController
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.Proxy
+import java.net.URL
 import java.util.concurrent.Executor
 import java.util.UUID
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -65,6 +75,7 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
     private var pendingWebPermission: PendingWebPermissionRequest? = null
     private var pendingDownloadRequest: BridgeDownloadRequest? = null
     private var permissionPromptDialog: AlertDialog? = null
+    private var contextActionDialog: AlertDialog? = null
     private val blobHookSecret = UUID.randomUUID().toString()
     private val pageDownloadBridge by lazy(LazyThreadSafetyMode.NONE) {
         PageFetchDownloadBridge(applicationContext, blobHookSecret)
@@ -175,6 +186,8 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
         pendingFileChooserCallback = null
         permissionPromptDialog?.dismiss()
         permissionPromptDialog = null
+        contextActionDialog?.dismiss()
+        contextActionDialog = null
         pendingWebPermission?.request?.deny()
         pendingWebPermission = null
         pendingDownloadRequest = null
@@ -304,6 +317,14 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
                 )
             }
         }
+        webView.setOnLongClickListener {
+            showContextActionsForCurrentHit()
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            webView.setOnContextClickListener {
+                showContextActionsForCurrentHit()
+            }
+        }
 
         webView.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
@@ -354,6 +375,23 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
                     ).show()
                     false
                 }
+            }
+
+            override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                val message = consoleMessage?.message().orEmpty()
+                if (
+                    message.contains("PWAPDownload", ignoreCase = true) ||
+                    message.contains("CORS", ignoreCase = true) ||
+                    message.contains("Access to fetch at", ignoreCase = true) ||
+                    message.contains("blocked by", ignoreCase = true)
+                ) {
+                    Log.w(
+                        DOWNLOAD_LOG_TAG,
+                        "console ${consoleMessage?.messageLevel()} " +
+                            "${consoleMessage?.sourceId()}:${consoleMessage?.lineNumber()} $message"
+                    )
+                }
+                return super.onConsoleMessage(consoleMessage)
             }
 
             override fun onCreateWindow(
@@ -525,12 +563,205 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
         startPendingDownload(pendingRequest)
     }
 
+    private fun showContextActionsForCurrentHit(): Boolean {
+        val hitResult = webView.hitTestResult ?: return false
+        if (!hitResult.isImageContextTarget()) {
+            return false
+        }
+        resolveContextImageTarget(hitResult) { target ->
+            if (target != null) {
+                showContextActionDialog(target)
+            }
+        }
+        return true
+    }
+
+    private fun resolveContextImageTarget(
+        hitResult: WebView.HitTestResult,
+        onResolved: (ContextImageTarget?) -> Unit
+    ) {
+        val fallbackUrl = hitResult.extra?.trim().orEmpty()
+        // requestFocusNodeHref gives us src/url for image links, which is more
+        // reliable than relying on hitTestResult.extra alone.
+        val message = Handler(Looper.getMainLooper()) { resolved ->
+            val data = resolved.data
+            val imageUrl = data.getString("src").orEmpty()
+                .ifBlank { fallbackUrl }
+                .takeIf { it.isNotBlank() }
+            val linkUrl = data.getString("url").orEmpty().takeIf { it.isNotBlank() }
+            onResolved(imageUrl?.let { ContextImageTarget(it, linkUrl) })
+            true
+        }.obtainMessage()
+        webView.requestFocusNodeHref(message)
+    }
+
+    private fun showContextActionDialog(target: ContextImageTarget) {
+        contextActionDialog?.dismiss()
+        contextActionDialog = AlertDialog.Builder(this)
+            .setTitle("图片操作")
+            .setItems(arrayOf("下载图片")) { _, which ->
+                if (which == 0) {
+                    startContextImageDownload(target)
+                }
+            }
+            .setOnDismissListener {
+                contextActionDialog = null
+            }
+            .show()
+    }
+
+    private fun startContextImageDownload(target: ContextImageTarget) {
+        val scheme = runCatching { Uri.parse(target.imageUrl).scheme.orEmpty().lowercase() }
+            .getOrDefault("")
+        if (scheme == "http" || scheme == "https") {
+            val request = BridgeDownloadRequest(
+                url = target.imageUrl,
+                contentDisposition = "",
+                mimeType = "",
+                contentLength = -1L,
+                suggestedFileName = URLUtil.guessFileName(target.imageUrl, null, null)
+            )
+            startNativeHttpDownload(request, webView.url.orEmpty())
+            return
+        }
+        handleDownloadRequest(
+            url = target.imageUrl,
+            userAgent = webView.settings.userAgentString,
+            contentDisposition = "",
+            mimeType = "",
+            contentLength = -1L
+        )
+    }
+
+    private fun startNativeHttpDownload(request: BridgeDownloadRequest, referer: String) {
+        val proxyPort = appliedProxyPort.takeIf { it > 0 } ?: ProxyManager.currentPort.value
+        if (proxyPort <= 0) {
+            Toast.makeText(this, "代理未就绪，无法开始下载", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val cookieHeader = CookieManager.getInstance().getCookie(request.url).orEmpty()
+        val userAgent = webView.settings.userAgentString.orEmpty()
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            executeNativeHttpDownload(
+                request = request,
+                proxyPort = proxyPort,
+                userAgent = userAgent,
+                cookieHeader = cookieHeader,
+                referer = referer
+            )
+        }
+        runOnUiThread {
+            Toast.makeText(this, "已开始下载", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun executeNativeHttpDownload(
+        request: BridgeDownloadRequest,
+        proxyPort: Int,
+        userAgent: String,
+        cookieHeader: String,
+        referer: String
+    ) {
+        var connection: HttpURLConnection? = null
+        var downloadId = ""
+        try {
+            connection = (URL(request.url).openConnection(
+                Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", proxyPort))
+            ) as HttpURLConnection).apply {
+                instanceFollowRedirects = true
+                connectTimeout = 15000
+                readTimeout = 30000
+                requestMethod = "GET"
+                if (userAgent.isNotBlank()) {
+                    setRequestProperty("User-Agent", userAgent)
+                }
+                if (cookieHeader.isNotBlank()) {
+                    setRequestProperty("Cookie", cookieHeader)
+                }
+                if (referer.isNotBlank()) {
+                    setRequestProperty("Referer", referer)
+                }
+                setRequestProperty("Accept", "*/*")
+                connect()
+            }
+
+            val responseCode = connection.responseCode
+            if (responseCode !in 200..299) {
+                throw IOException(
+                    "HTTP $responseCode ${connection.responseMessage.orEmpty()}".trim()
+                )
+            }
+
+            val metadataJson = JSONObject().apply {
+                put("url", request.url)
+                put("finalUrl", connection.url.toString())
+                put(
+                    "contentDisposition",
+                    connection.getHeaderField("Content-Disposition").orEmpty()
+                )
+                put("mimeType", connection.contentType?.substringBefore(';').orEmpty())
+                put(
+                    "contentLength",
+                    connection.contentLengthLong.takeIf { it > 0 } ?: request.contentLength
+                )
+                put("suggestedFileName", request.suggestedFileName)
+            }.toString()
+
+            downloadId = PageFetchDownloadStore.beginDownload(
+                applicationContext,
+                request,
+                metadataJson
+            ) ?: throw IOException("无法创建下载任务")
+
+            connection.inputStream.use { input ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) {
+                        break
+                    }
+                    if (read == 0) {
+                        continue
+                    }
+                    if (!PageFetchDownloadStore.appendBytes(applicationContext, downloadId, buffer, read)) {
+                        throw IOException("写入下载内容失败")
+                    }
+                }
+            }
+
+            if (!PageFetchDownloadStore.finishDownload(applicationContext, downloadId)) {
+                throw IOException("完成下载失败")
+            }
+        } catch (error: Exception) {
+            Log.e(DOWNLOAD_LOG_TAG, "native http download failed url=${request.url}", error)
+            if (downloadId.isNotBlank()) {
+                PageFetchDownloadStore.failDownload(
+                    applicationContext,
+                    downloadId,
+                    error.message ?: "下载失败"
+                )
+            } else {
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        error.message ?: "下载失败",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        } finally {
+            connection?.disconnect()
+        }
+    }
+
     private fun startPendingDownload(request: BridgeDownloadRequest) {
         val scheme = runCatching { Uri.parse(request.url).scheme.orEmpty().lowercase() }.getOrDefault("")
-        if (scheme == "blob") {
-            startBlobResolveDownload(request)
-        } else {
-            startJavascriptDownload(request)
+        when (scheme) {
+            "blob" -> startBlobResolveDownload(request)
+            "http", "https" -> startNativeHttpDownload(request, webView.url.orEmpty())
+            else -> startJavascriptDownload(request)
         }
     }
 
@@ -589,12 +820,22 @@ private data class PendingWebPermissionRequest(
     val androidPermissions: List<String>,
 )
 
+private data class ContextImageTarget(
+    val imageUrl: String,
+    val linkUrl: String?,
+)
+
 private fun toAndroidPermission(resource: String): String? {
     return when (resource) {
         PermissionRequest.RESOURCE_VIDEO_CAPTURE -> Manifest.permission.CAMERA
         PermissionRequest.RESOURCE_AUDIO_CAPTURE -> Manifest.permission.RECORD_AUDIO
         else -> null
     }
+}
+
+private fun WebView.HitTestResult.isImageContextTarget(): Boolean {
+    return type == WebView.HitTestResult.IMAGE_TYPE ||
+        type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE
 }
 
 private fun WebView.applyBrowserSettings(backgroundColor: Int, supportsMultipleWindows: Boolean) {
@@ -707,6 +948,13 @@ private fun buildFetchDownloadScript(request: BridgeDownloadRequest, requestToke
           const requestToken = ${requestToken.toJsString()};
           const bridge = window.${JS_DOWNLOAD_BRIDGE_NAME};
           let downloadId = '';
+          const targetOrigin = (() => {
+            try {
+              return new URL(request.url, location.href).origin;
+            } catch (error) {
+              return 'unknown';
+            }
+          })();
 
           function bytesToBase64(bytes) {
             let binary = '';
@@ -765,11 +1013,17 @@ private fun buildFetchDownloadScript(request: BridgeDownloadRequest, requestToke
               throw new Error('native finishDownload failed');
             }
           } catch (error) {
+            const errorName = error && error.name ? error.name : 'Error';
             const message = error && error.message ? error.message : String(error);
+            const detailedMessage =
+              `${'$'}{errorName}: ${'$'}{message}; frameOrigin=${'$'}{location.origin}; targetOrigin=${'$'}{targetOrigin}; target=${'$'}{request.url}`;
+            if (typeof console !== 'undefined' && console.error) {
+              console.error(`PWAPDownload fetch failed ${'$'}{detailedMessage}`);
+            }
             if (downloadId) {
-              bridge.failDownload(downloadId, message);
+              bridge.failDownload(downloadId, detailedMessage);
             } else {
-              bridge.reportError(requestToken, message);
+              bridge.reportError(requestToken, detailedMessage);
             }
           }
         })();
