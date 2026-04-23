@@ -17,7 +17,7 @@ class ProximitySensorManager(
     private var coverCount = 0
     private var lastCoverTime = 0L
     private var wasCovered = false
-    private val requiredCovers = 5
+    private val requiredCovers = 4
     private val windowMs = 5000L
 
     fun register() {
