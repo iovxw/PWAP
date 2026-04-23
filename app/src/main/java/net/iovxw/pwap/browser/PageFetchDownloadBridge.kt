@@ -27,6 +27,7 @@ import java.io.IOException
 import java.io.OutputStream
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
+import net.iovxw.pwap.R
 import org.json.JSONObject
 
 internal data class BridgeDownloadRequest(
@@ -85,7 +86,11 @@ internal class PageFetchDownloadBridge(
                 DOWNLOAD_LOG_TAG,
                 "blob resolve timeout requestId=$requestId url=${expiredRequest.url}"
             )
-            Toast.makeText(appContext, "页面未提供可下载的 Blob 数据", Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                appContext,
+                appContext.getString(R.string.blob_data_not_available),
+                Toast.LENGTH_SHORT
+            ).show()
         }
         synchronized(lock) {
             pendingBlobResolveRequests[requestId] = request
@@ -163,7 +168,7 @@ internal class PageFetchDownloadBridge(
         return PageFetchDownloadStore.failDownload(
             appContext,
             downloadId,
-            message?.takeIf { it.isNotBlank() } ?: "下载失败"
+            message?.takeIf { it.isNotBlank() } ?: appContext.getString(R.string.download_failed)
         )
     }
 
@@ -172,7 +177,8 @@ internal class PageFetchDownloadBridge(
         synchronized(lock) {
             pendingRequests.remove(token)
         }
-        val errorMessage = message?.takeIf { it.isNotBlank() } ?: "下载失败"
+        val errorMessage = message?.takeIf { it.isNotBlank() }
+            ?: appContext.getString(R.string.download_failed)
         Log.e(DOWNLOAD_LOG_TAG, "bridge reportError token=$token message=$errorMessage")
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, errorMessage, Toast.LENGTH_SHORT).show()
@@ -185,7 +191,8 @@ internal class PageFetchDownloadBridge(
         if (secret != blobHookSecret) {
             return false
         }
-        val errorMessage = message?.takeIf { it.isNotBlank() } ?: "下载失败"
+        val errorMessage = message?.takeIf { it.isNotBlank() }
+            ?: appContext.getString(R.string.download_failed)
         Log.e(DOWNLOAD_LOG_TAG, "intercepted reportError message=$errorMessage")
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, errorMessage, Toast.LENGTH_SHORT).show()
@@ -259,7 +266,7 @@ internal object PageFetchDownloadStore {
             val outputUri = createPendingDownloadUri(context, metadata.fileName, metadata.mimeType)
             val outputStream = context.contentResolver.openOutputStream(outputUri)
                 ?.buffered()
-                ?: throw IOException("无法写入下载文件")
+                ?: throw IOException(context.getString(R.string.cannot_write_download_file))
             val downloadId = UUID.randomUUID().toString()
             val notificationId = nextNotificationId.incrementAndGet()
             val now = SystemClock.elapsedRealtime()
@@ -317,7 +324,11 @@ internal object PageFetchDownloadStore {
             true
         }.getOrElse { error ->
             Log.e(DOWNLOAD_LOG_TAG, "append chunk failed for $downloadId", error)
-            failDownload(context, downloadId, error.message ?: "写入下载内容失败")
+            failDownload(
+                context,
+                downloadId,
+                error.message ?: context.getString(R.string.write_download_content_failed)
+            )
             false
         }
     }
@@ -341,7 +352,11 @@ internal object PageFetchDownloadStore {
             true
         }.getOrElse { error ->
             Log.e(DOWNLOAD_LOG_TAG, "append bytes failed for $downloadId", error)
-            failDownload(context, downloadId, error.message ?: "写入下载内容失败")
+            failDownload(
+                context,
+                downloadId,
+                error.message ?: context.getString(R.string.write_download_content_failed)
+            )
             false
         }
     }
@@ -364,7 +379,11 @@ internal object PageFetchDownloadStore {
         }.getOrElse { error ->
             Log.e(DOWNLOAD_LOG_TAG, "finish failed for $downloadId", error)
             deleteDownloadUri(context, session.outputUri)
-            postFailureNotification(context, session.notificationId, error.message ?: "下载失败")
+            postFailureNotification(
+                context,
+                session.notificationId,
+                error.message ?: context.getString(R.string.download_failed)
+            )
             onSessionFinished(context)
             false
         }
@@ -464,17 +483,17 @@ internal object PageFetchDownloadStore {
         val notificationManager = context.getSystemService(NotificationManager::class.java)
         val activeChannel = NotificationChannel(
             ACTIVE_CHANNEL_ID,
-            "后台下载",
+            context.getString(R.string.background_download_channel_name),
             NotificationManager.IMPORTANCE_LOW
         ).apply {
-            description = "显示正在进行的下载任务"
+            description = context.getString(R.string.background_download_channel_description)
         }
         val completeChannel = NotificationChannel(
             COMPLETE_CHANNEL_ID,
-            "下载完成",
+            context.getString(R.string.download_complete_channel_name),
             NotificationManager.IMPORTANCE_DEFAULT
         ).apply {
-            description = "显示下载完成或失败通知"
+            description = context.getString(R.string.download_complete_channel_description)
         }
         notificationManager.createNotificationChannel(activeChannel)
         notificationManager.createNotificationChannel(completeChannel)
@@ -488,7 +507,7 @@ internal object PageFetchDownloadStore {
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
         return context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: throw IOException("无法创建下载目标")
+            ?: throw IOException(context.getString(R.string.cannot_create_download_target))
     }
 
     private fun finalizeDownloadUri(context: Context, uri: Uri) {
@@ -497,7 +516,7 @@ internal object PageFetchDownloadStore {
         }
         val updatedRows = context.contentResolver.update(uri, values, null, null)
         if (updatedRows <= 0) {
-            throw IOException("无法完成下载文件写入")
+            throw IOException(context.getString(R.string.cannot_finalize_download_file))
         }
     }
 
@@ -602,7 +621,7 @@ internal object PageFetchDownloadStore {
             .setContentText(buildProgressText(context, download))
             .addAction(
                 android.R.drawable.ic_menu_close_clear_cancel,
-                "取消",
+                context.getString(R.string.cancel),
                 WebDownloadService.createCancelPendingIntent(
                     context = context,
                     downloadId = download.downloadId,
@@ -628,7 +647,10 @@ internal object PageFetchDownloadStore {
             clipData = ClipData.newRawUri(session.fileName, session.outputUri)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        val chooserIntent = Intent.createChooser(openIntent, "打开下载文件").apply {
+        val chooserIntent = Intent.createChooser(
+            openIntent,
+            context.getString(R.string.open_download_file)
+        ).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
             clipData = ClipData.newRawUri(session.fileName, session.outputUri)
         }
@@ -643,8 +665,8 @@ internal object PageFetchDownloadStore {
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setAutoCancel(true)
             .setContentTitle(session.fileName)
-            .setContentText("下载完成，已保存到 Downloads")
-            .addAction(android.R.drawable.ic_menu_view, "打开", openPendingIntent)
+            .setContentText(context.getString(R.string.download_complete_saved))
+            .addAction(android.R.drawable.ic_menu_view, context.getString(R.string.open), openPendingIntent)
 
         context.getSystemService(NotificationManager::class.java)
             .notify(session.notificationId, builder.build())
@@ -654,7 +676,7 @@ internal object PageFetchDownloadStore {
         val builder = NotificationCompat.Builder(context, COMPLETE_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_notify_error)
             .setAutoCancel(true)
-            .setContentTitle("下载失败")
+            .setContentTitle(context.getString(R.string.download_failed_title))
             .setContentText(message)
             .setStyle(NotificationCompat.BigTextStyle().bigText(message))
         createAppPendingIntent(context)?.let(builder::setContentIntent)
@@ -667,7 +689,10 @@ internal object PageFetchDownloadStore {
             "${Formatter.formatShortFileSize(context, download.downloadedBytes)} / " +
                 Formatter.formatShortFileSize(context, download.totalBytes)
         } else {
-            "已下载 ${Formatter.formatShortFileSize(context, download.downloadedBytes)}"
+            context.getString(
+                R.string.downloaded_size,
+                Formatter.formatShortFileSize(context, download.downloadedBytes)
+            )
         }
         val speedText = download.speedBytesPerSecond
             .takeIf { it > 0L }

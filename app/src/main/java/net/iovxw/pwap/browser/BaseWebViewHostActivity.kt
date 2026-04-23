@@ -100,7 +100,8 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
                 ?.toTypedArray()
 
             if (result.resultCode == Activity.RESULT_OK && acceptedUris == null) {
-                Toast.makeText(this, "所选文件无法访问", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, getString(R.string.selected_file_inaccessible), Toast.LENGTH_SHORT)
+                    .show()
             }
             callback.onReceiveValue(acceptedUris)
         }
@@ -116,7 +117,8 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
                 pendingRequest.request.grant(pendingRequest.resources.toTypedArray())
             } else {
                 pendingRequest.request.deny()
-                Toast.makeText(this, "系统权限被拒绝", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, getString(R.string.system_permission_denied), Toast.LENGTH_SHORT)
+                    .show()
             }
         }
     private val notificationPermissionLauncher =
@@ -126,7 +128,7 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
             if (!granted) {
                 Toast.makeText(
                     this,
-                    "未授予通知权限，后台下载通知可能不可见",
+                    getString(R.string.notification_permission_denied),
                     Toast.LENGTH_SHORT
                 ).show()
             }
@@ -191,7 +193,7 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
         pendingWebPermission?.request?.deny()
         pendingWebPermission = null
         pendingDownloadRequest = null
-        pageDownloadBridge.abortAll("页面已关闭，下载已取消")
+        pageDownloadBridge.abortAll(getString(R.string.page_closed_download_cancelled))
         if (::webView.isInitialized) {
             webView.stopLoading()
             webView.destroy()
@@ -370,7 +372,7 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
                     filePathCallback.onReceiveValue(null)
                     Toast.makeText(
                         this@BaseWebViewHostActivity,
-                        "系统未找到可用的文件选择器",
+                        getString(R.string.file_chooser_unavailable),
                         Toast.LENGTH_SHORT
                     ).show()
                     false
@@ -461,13 +463,13 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
 
         pendingWebPermission = pendingRequest
         permissionPromptDialog = AlertDialog.Builder(this)
-            .setTitle("网站请求设备权限")
+            .setTitle(getString(R.string.website_requests_permission_title))
             .setMessage(buildPermissionRequestMessage(pendingRequest))
-            .setPositiveButton("允许") { _, _ ->
+            .setPositiveButton(getString(R.string.allow)) { _, _ ->
                 permissionPromptDialog = null
                 continueGrantWebPermission(pendingRequest)
             }
-            .setNegativeButton("拒绝") { _, _ ->
+            .setNegativeButton(getString(R.string.deny)) { _, _ ->
                 permissionPromptDialog = null
                 pendingWebPermission = null
                 request.deny()
@@ -506,14 +508,14 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
     private fun buildPermissionRequestMessage(pendingRequest: PendingWebPermissionRequest): String {
         val originLabel = pendingRequest.origin.host?.takeIf { it.isNotBlank() }
             ?: pendingRequest.origin.toString()
-        val requestedFeatures = pendingRequest.resources.joinToString("、") { resource ->
+        val requestedFeatures = pendingRequest.resources.joinToString(getString(R.string.list_separator)) { resource ->
             when (resource) {
-                PermissionRequest.RESOURCE_VIDEO_CAPTURE -> "相机"
-                PermissionRequest.RESOURCE_AUDIO_CAPTURE -> "麦克风"
+                PermissionRequest.RESOURCE_VIDEO_CAPTURE -> getString(R.string.permission_feature_camera)
+                PermissionRequest.RESOURCE_AUDIO_CAPTURE -> getString(R.string.permission_feature_microphone)
                 else -> resource
             }
         }
-        return "$originLabel 请求访问：$requestedFeatures"
+        return getString(R.string.permission_request_message, originLabel, requestedFeatures)
     }
 
     private fun handleDownloadRequest(
@@ -532,7 +534,8 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
         )
         if (scheme !in setOf("http", "https", "blob", "data")) {
             Log.w(DOWNLOAD_LOG_TAG, "unsupported download scheme: $scheme")
-            Toast.makeText(this, "暂不支持该下载类型", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, getString(R.string.download_type_unsupported), Toast.LENGTH_SHORT)
+                .show()
             return
         }
 
@@ -598,8 +601,8 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
     private fun showContextActionDialog(target: ContextImageTarget) {
         contextActionDialog?.dismiss()
         contextActionDialog = AlertDialog.Builder(this)
-            .setTitle("图片操作")
-            .setItems(arrayOf("下载图片")) { _, which ->
+            .setTitle(getString(R.string.image_actions_title))
+            .setItems(arrayOf(getString(R.string.download_image))) { _, which ->
                 if (which == 0) {
                     startContextImageDownload(target)
                 }
@@ -636,7 +639,8 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
     private fun startNativeHttpDownload(request: BridgeDownloadRequest, referer: String) {
         val proxyPort = appliedProxyPort.takeIf { it > 0 } ?: ProxyManager.currentPort.value
         if (proxyPort <= 0) {
-            Toast.makeText(this, "代理未就绪，无法开始下载", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, getString(R.string.proxy_not_ready_download), Toast.LENGTH_SHORT)
+                .show()
             return
         }
 
@@ -653,7 +657,7 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
             )
         }
         runOnUiThread {
-            Toast.makeText(this, "已开始下载", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, getString(R.string.download_started), Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -713,7 +717,7 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
                 applicationContext,
                 request,
                 metadataJson
-            ) ?: throw IOException("无法创建下载任务")
+            ) ?: throw IOException(getString(R.string.cannot_create_download_task))
 
             connection.inputStream.use { input ->
                 val buffer = ByteArray(64 * 1024)
@@ -726,13 +730,13 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
                         continue
                     }
                     if (!PageFetchDownloadStore.appendBytes(applicationContext, downloadId, buffer, read)) {
-                        throw IOException("写入下载内容失败")
+                        throw IOException(getString(R.string.write_download_content_failed))
                     }
                 }
             }
 
             if (!PageFetchDownloadStore.finishDownload(applicationContext, downloadId)) {
-                throw IOException("完成下载失败")
+                throw IOException(getString(R.string.cannot_complete_download))
             }
         } catch (error: Exception) {
             Log.e(DOWNLOAD_LOG_TAG, "native http download failed url=${request.url}", error)
@@ -740,13 +744,13 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
                 PageFetchDownloadStore.failDownload(
                     applicationContext,
                     downloadId,
-                    error.message ?: "下载失败"
+                    error.message ?: getString(R.string.download_failed)
                 )
             } else {
                 runOnUiThread {
                     Toast.makeText(
                         this,
-                        error.message ?: "下载失败",
+                        error.message ?: getString(R.string.download_failed),
                         Toast.LENGTH_SHORT
                     ).show()
                 }
@@ -769,7 +773,7 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
         val requestToken = pageDownloadBridge.prepareRequest(request)
         val script = buildFetchDownloadScript(request, requestToken)
         webView.evaluateJavascript(script, null)
-        Toast.makeText(this, "已开始下载", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, getString(R.string.download_started), Toast.LENGTH_SHORT).show()
     }
 
     private fun startBlobResolveDownload(request: BridgeDownloadRequest) {
@@ -779,11 +783,11 @@ abstract class BaseWebViewHostActivity : AppCompatActivity() {
             if (rawValue != "true") {
                 pageDownloadBridge.failPendingBlobResolveRequest(
                     requestId,
-                    "当前页面未安装 Blob 下载桥接"
+                    getString(R.string.blob_download_bridge_missing)
                 )
             }
         }
-        Toast.makeText(this, "已开始下载", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, getString(R.string.download_started), Toast.LENGTH_SHORT).show()
     }
 
     private fun installBlobDownloadHook() {

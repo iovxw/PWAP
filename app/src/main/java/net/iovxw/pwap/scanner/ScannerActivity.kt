@@ -10,6 +10,7 @@ import com.king.camera.scan.analyze.Analyzer
 import com.king.zxing.DecodeConfig
 import com.king.zxing.BarcodeCameraScanActivity
 import com.king.zxing.analyze.QRCodeAnalyzer
+import net.iovxw.pwap.R
 
 class ScannerActivity : BarcodeCameraScanActivity() {
 
@@ -22,7 +23,7 @@ class ScannerActivity : BarcodeCameraScanActivity() {
         cameraScan.setAnalyzeImage(false)
         val text = result.result?.text
         if (text.isNullOrBlank()) {
-            Toast.makeText(this, "未识别到内容", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, getString(R.string.scanner_no_content), Toast.LENGTH_SHORT).show()
             cameraScan.setAnalyzeImage(true)
             return
         }
